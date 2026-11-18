@@ -1,0 +1,38 @@
+# xr Deployer
+
+سایت نصب‌کننده‌ی xr PANEL روی Cloudflare Workers (Node بدون وابستگی، آماده‌ی Railway).
+
+## Deploy روی Railway
+1. این پوشه را روی یک ریپوی GitHub بگذار.
+2. railway.com → New Project → Deploy from GitHub repo. (Railway خودش `Dockerfile` را تشخیص می‌دهد.)
+3. Settings → Networking → Generate Domain.
+
+اجرای محلی: `node server.js` یا `docker build -t xr-deployer . && docker run -p 3000:3000 xr-deployer`
+
+## جریان کار
+توکن → تأیید → انتخاب اسم و پلن → ساخت D1 → آپلود assets → نصب Worker → فعال‌سازی workers.dev → نمایش دامنه.
+
+- لینک «ساخت توکن» دسترسی‌های Workers Scripts:Edit، D1:Edit، Account Analytics:Read و Account Settings:Read را از قبل پر می‌کند.
+- همین توکن به‌صورت secret (`CF_API_TOKEN`) داخل Worker گذاشته می‌شود تا Home تعداد درخواست‌های امروز را از GraphQL Analytics بخواند.
+- توکن در سرور deployer ذخیره یا لاگ نمی‌شود و فقط در حافظه‌ی همان نصب می‌ماند.
+- دوباره نصب کردن با همان اسم = آپدیت (دیتابیس حفظ می‌شود).
+
+ورود اولیه پنل: `admin` / `admin` (فوراً عوض کن).
+
+## سورس worker از GitHub
+فایل‌های worker داخل این پروژه نیستند؛ موقع هر نصب از `github.com/amirh00sain/xrpanel` (شاخه‌ی `main`) دانلود می‌شوند. ریپو باید `src/index.js` و پوشه‌ی `public/` داشته باشد (همان ساختار xr-worker.zip).
+متغیرهای اختیاری Railway: `GITHUB_REPO` (پیش‌فرض `amirh00sain/xrpanel`)، `GITHUB_BRANCH` (پیش‌فرض `main`)، `GITHUB_TOKEN` (برای ریپوی خصوصی).
+
+## تغییرات در worker (داخل xr-worker.zip)
+- `src/index.js`: مسیر `/api/cf` (کش ۶۰ ثانیه‌ای؛ Workers و Pages Functions هر دو شمرده می‌شن).
+- `src/ui.js`: کارت «Requests today» در Home.
+
+## Workers یا Pages
+در مرحله‌ی تنظیمات می‌توانی انتخاب کنی. Workers با workers.dev و Pages با pages.dev. برای Pages، worker موقع نصب با esbuild به یک فایل `_worker.js` تبدیل می‌شود و مسیر `/static/*` از Worker معاف است. بایندینگ D1 و secretها روی خود پروژه‌ی Pages تنظیم می‌شوند.
+
+## نسخه‌ی ۱.۲ (اصلاحات سازگاری با xrpanel)
+- اگر ریپو پوشه‌ی `public/` نداشته باشد دیگر session خالی برای assets ساخته نمی‌شود (Worker بدون assets نصب می‌شود).
+- اگر `src/index.js` کلاس `WebProxySession` را export کند، بایندینگ Durable Object با نام `SESSIONS` و migration (SQLite) خودکار اضافه می‌شود. در آپدیت، اگر Cloudflare همان migration را رد کند، آپلود بدون migration تکرار می‌شود.
+- `GITHUB_REPO` و `GITHUB_BRANCH` به‌صورت متغیر داخل Worker گذاشته می‌شوند تا «Settings → Update» پنل از همان ریپویی که نصب شده آپدیت بگیرد.
+- هدف Pages: فقط export پیش‌فرض bundle می‌شود (کلاس Durable Object داخل Pages معنی ندارد) و `/static/*` فقط وقتی از Worker معاف می‌شود که ریپو واقعاً `public/static` داشته باشد. وب‌پروکسی تلگرام روی Pages کار نمی‌کند.
+- مرحله‌ی «check»: اگر سایت تا پایان انتظار مدام 5xx بدهد (مثل 1101)، به‌جای «موفق»، خطا با متن پاسخ نشان داده می‌شود.

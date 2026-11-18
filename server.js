@@ -1,0 +1,259 @@
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import zlib from 'node:zlib';
+import os from 'node:os';
+import { fileURLToPath } from 'node:url';
+
+const ROOT = path.dirname(fileURLToPath(import.meta.url));
+const API = 'https://api.cloudflare.com/client/v4';
+const MIME = { js: 'text/javascript', css: 'text/css', svg: 'image/svg+xml', html: 'text/html; charset=utf-8', json: 'application/json' };
+const jobs = new Map();
+
+// ---------- Cloudflare helpers ----------
+async function cf(token, method, p, body, extra = {}) {
+  const r = await fetch(API + p, {
+    method,
+    headers: { Authorization: 'Bearer ' + token, ...(body && !(body instanceof FormData) ? { 'content-type': 'application/json' } : {}), ...extra },
+    body: body instanceof FormData ? body : body ? JSON.stringify(body) : undefined,
+  });
+  let j; try { j = await r.json(); } catch { j = { success: false, errors: [{ message: 'HTTP ' + r.status }] }; }
+  if (!j.success) throw new Error((j.errors || []).map(e => e.message).join('; ') || 'HTTP ' + r.status);
+  return j.result;
+}
+
+function walk(dir, base = dir) {
+  return fs.readdirSync(dir, { withFileTypes: true }).flatMap(e => {
+    const f = path.join(dir, e.name);
+    return e.isDirectory() ? walk(f, base) : [{ file: f, rel: '/' + path.relative(base, f).split(path.sep).join('/') }];
+  });
+}
+
+const REPO = process.env.GITHUB_REPO || 'amirh00sain/xrpanel', BRANCH = process.env.GITHUB_BRANCH || 'main';
+
+// Downloads the worker source straight from GitHub (tar.gz, parsed here: no dependencies).
+async function fetchSource() {
+  const r = await fetch(`https://codeload.github.com/${REPO}/tar.gz/refs/heads/${BRANCH}`, { headers: process.env.GITHUB_TOKEN ? { Authorization: 'Bearer ' + process.env.GITHUB_TOKEN } : {} });
+  if (!r.ok) throw new Error(`GitHub ${r.status}: cannot download ${REPO}@${BRANCH}`);
+  const tar = zlib.gunzipSync(Buffer.from(await r.arrayBuffer())), all = new Map();
+  for (let o = 0, pax = null; o + 512 <= tar.length;) {
+    const h = tar.subarray(o, o + 512); if (!h[0]) break;
+    let name = h.toString('utf8', 0, 100).replace(/\0.*$/, ''); const pre = h.toString('utf8', 345, 500).replace(/\0.*$/, ''); if (pre) name = pre + '/' + name;
+    const size = parseInt(h.toString('ascii', 124, 136).replace(/\0.*$/, '').trim() || '0', 8), type = String.fromCharCode(h[156]);
+    const data = tar.subarray(o + 512, o + 512 + size); o += 512 + Math.ceil(size / 512) * 512;
+    if (type === 'x') { const m = /\d+ path=([^\n]*)\n/.exec(data.toString()); pax = m && m[1]; continue; }
+    if (type === 'g') continue;
+    if (pax) { name = pax; pax = null; }
+    if (type === '0' || type === '\0') all.set(name, Buffer.from(data));
+  }
+  const idx = [...all.keys()].find(k => /(^|\/)src\/index\.js$/.test(k));
+  if (!idx) throw new Error(`src/index.js not found in ${REPO}@${BRANCH}`);
+  const root = idx.slice(0, -'src/index.js'.length), files = [], mods = [];
+  for (const [k, buf] of all) {
+    if (!k.startsWith(root)) continue;
+    const rel = k.slice(root.length);
+    if (rel.startsWith('public/')) { const p = rel.slice(6), ext = path.extname(p).slice(1), b64 = buf.toString('base64'); files.push({ rel: p, b64, ext, size: buf.length, ct: MIME[ext] || 'application/octet-stream' }); }
+    else if (/^src\/[^/]+\.js$/.test(rel)) mods.push({ name: rel.slice(4), buf });
+  }
+  return { files, mods };
+}
+
+// Pages needs ONE file: bundle the modules with esbuild.
+async function bundleWorker(mods) {
+  const { build } = await import('esbuild');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xr-'));
+  try {
+    for (const m of mods) fs.writeFileSync(path.join(dir, m.name), m.buf);
+    const out = await build({ stdin: { contents: "import app from './index.js';\nexport default app;\n", resolveDir: dir, sourcefile: 'entry.js', loader: 'js' }, bundle: true, format: 'esm', platform: 'neutral', target: 'es2022', external: ['cloudflare:sockets'], write: false, outfile: path.join(dir, 'out.js'), logLevel: 'silent' });
+    return Buffer.from(out.outputFiles[0].contents);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+}
+const limitOf = plan => (plan === 'paid' ? '0' : '100000');
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const DO_CLASS = 'WebProxySession', DO_TAG = 'v2-webproxy';
+const hasDO = src => src.mods.some(m => m.name === 'index.js' && new RegExp('export\\s+class\\s+' + DO_CLASS + '\\b').test(m.buf.toString('utf8')));
+
+// Waits until the new site answers. A site that keeps answering 5xx (Cloudflare 1101 / 1102 / D1 problems) is reported
+// instead of being announced as "done"; DNS that is not ready yet is not an error.
+async function waitUp(domain, tries, gap) {
+  let bad = null;
+  for (let i = 0; i < tries; i++) {
+    try {
+      const r = await fetch(`https://${domain}/login`, { redirect: 'manual' });
+      if (r.status < 500) return null;
+      bad = `HTTP ${r.status}: ` + (await r.text()).replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 240);
+    } catch { bad = null; }
+    await sleep(gap);
+  }
+  return bad;
+}
+
+async function deployPages(job, { token, accountId, name, plan }) {
+  const log = m => job.logs.push(m);
+  const a = `/accounts/${accountId}`;
+  try {
+    log('src');
+    const src = await fetchSource();
+    log('db');
+    const dbName = name + '-db';
+    const found = (await cf(token, 'GET', `${a}/d1/database?name=${encodeURIComponent(dbName)}`)).find(d => d.name === dbName);
+    const dbId = found ? found.uuid : (await cf(token, 'POST', `${a}/d1/database`, { name: dbName })).uuid;
+
+    log('project');
+    let proj;
+    try { proj = await cf(token, 'GET', `${a}/pages/projects/${name}`); }
+    catch { proj = await cf(token, 'POST', `${a}/pages/projects`, { name, production_branch: 'main' }); }
+    const cfg = { compatibility_date: '2025-06-01', d1_databases: { DB: { id: dbId } }, env_vars: {
+      CF_ACCOUNT_ID: { type: 'plain_text', value: accountId }, CF_REQ_LIMIT: { type: 'plain_text', value: limitOf(plan) }, GITHUB_REPO: { type: 'plain_text', value: REPO }, GITHUB_BRANCH: { type: 'plain_text', value: BRANCH }, CF_API_TOKEN: { type: 'secret_text', value: token } } };
+    await cf(token, 'PATCH', `${a}/pages/projects/${name}`, { deployment_configs: { production: cfg, preview: cfg } });
+
+    log('assets');
+    const { blake3 } = await import('hash-wasm');
+    const files = [];
+    for (const f of src.files) files.push({ ...f, hash: (await blake3(f.b64 + f.ext)).slice(0, 32) });
+    const jwt = (await cf(token, 'GET', `${a}/pages/projects/${name}/upload-token`)).jwt;
+    const hashes = files.map(f => f.hash);
+    if (hashes.length) {
+      const missing = new Set(await cf(jwt, 'POST', '/pages/assets/check-missing', { hashes }));
+      const todo = files.filter(f => missing.has(f.hash));
+      if (todo.length) await cf(jwt, 'POST', '/pages/assets/upload', todo.map(f => ({ key: f.hash, value: f.b64, metadata: { contentType: f.ct }, base64: true })));
+      await cf(jwt, 'POST', '/pages/assets/upsert-hashes', { hashes });
+    }
+
+    log('script');
+    // _worker.bundle = a multipart document with metadata + the bundled module (built by esbuild in the Dockerfile)
+    const inner = new FormData();
+    inner.append('metadata', new Blob([JSON.stringify({ main_module: '_worker.js' })], { type: 'application/json' }));
+    inner.append('_worker.js', new Blob([await bundleWorker(src.mods)], { type: 'application/javascript+module' }), '_worker.js');
+    const bundle = await new Response(inner).blob();
+    const fd = new FormData();
+    fd.append('manifest', JSON.stringify(Object.fromEntries(files.map(f => [f.rel, f.hash]))));
+    fd.append('branch', 'main');
+    fd.append('_worker.bundle', bundle, '_worker.bundle');
+    // /static/* is only taken away from the Worker when the repo really ships those files in public/static
+    const routes = { version: 1, include: ['/*'], ...(files.some(f => f.rel.startsWith('/static/')) ? { exclude: ['/static/*'] } : {}) };
+    fd.append('_routes.json', new Blob([JSON.stringify(routes)], { type: 'application/json' }), '_routes.json');
+    await cf(token, 'POST', `${a}/pages/projects/${name}/deployments`, fd);
+
+    const domain = proj.subdomain || `${name}.pages.dev`;
+    log('check');
+    const badP = await waitUp(domain, 12, 4000);
+    if (badP) throw new Error(`Deployed to https://${domain}, but the site answers ${badP}`);
+    job.domain = domain; job.status = 'done';
+  } catch (e) { job.status = 'error'; job.error = String(e.message || e); }
+  setTimeout(() => jobs.delete(job.id), 30 * 60e3);
+}
+
+async function deploy(job, { token, accountId, name, plan }) {
+  const log = m => job.logs.push(m);
+  const a = `/accounts/${accountId}`;
+  try {
+    log('src');
+    const src = await fetchSource();
+    // 1. database
+    log('db');
+    const dbName = name + '-db';
+    const found = (await cf(token, 'GET', `${a}/d1/database?name=${encodeURIComponent(dbName)}`)).find(d => d.name === dbName);
+    const dbId = found ? found.uuid : (await cf(token, 'POST', `${a}/d1/database`, { name: dbName })).uuid;
+
+    // 2. static assets
+    log('assets');
+    const files = src.files.map(f => ({ ...f, hash: crypto.createHash('sha256').update(f.b64 + f.ext).digest('hex').slice(0, 32) }));
+    const manifest = Object.fromEntries(files.map(f => [f.rel, { hash: f.hash, size: f.size }]));
+    let jwt = null;
+    // an empty manifest is not sent: the Worker then simply has no assets (the panel serves its own files)
+    const sess = files.length ? await cf(token, 'POST', `${a}/workers/scripts/${name}/assets-upload-session`, { manifest }) : { buckets: [] };
+    jwt = sess.jwt || null;
+    for (const bucket of sess.buckets || []) {
+      const fd = new FormData();
+      for (const h of bucket) { const f = files.find(x => x.hash === h); fd.append(h, new Blob([f.b64], { type: MIME[f.ext] || 'application/octet-stream' }), h); }
+      const up = await cf(sess.jwt, 'POST', `${a}/workers/assets/upload?base64=true`, fd);
+      if (up && up.jwt) jwt = up.jwt;
+    }
+
+    // 3. worker script + bindings
+    log('script');
+    const withDO = hasDO(src);
+    const meta = {
+      main_module: 'index.js',
+      compatibility_date: '2025-06-01',
+      ...(jwt ? { assets: { jwt, config: {} } } : {}),
+      bindings: [
+        { type: 'd1', name: 'DB', id: dbId },
+        { type: 'plain_text', name: 'CF_ACCOUNT_ID', text: accountId },
+        { type: 'plain_text', name: 'CF_REQ_LIMIT', text: limitOf(plan) },
+        { type: 'plain_text', name: 'GITHUB_REPO', text: REPO },
+        { type: 'plain_text', name: 'GITHUB_BRANCH', text: BRANCH },
+        { type: 'secret_text', name: 'CF_API_TOKEN', text: token },
+        ...(withDO ? [{ type: 'durable_object_namespace', name: 'SESSIONS', class_name: DO_CLASS }] : []),
+      ],
+    };
+    const upload = migrate => {
+      const fd = new FormData();
+      fd.append('metadata', new Blob([JSON.stringify(migrate ? { ...meta, migrations: { new_tag: DO_TAG, new_sqlite_classes: [DO_CLASS] } } : meta)], { type: 'application/json' }));
+      for (const m of src.mods) fd.append(m.name, new Blob([m.buf], { type: 'application/javascript+module' }), m.name);
+      return cf(token, 'PUT', `${a}/workers/scripts/${name}`, fd);
+    };
+    // First install creates the Durable Object class (SQLite-backed, allowed on the free plan). On an update the class
+    // already exists, Cloudflare refuses the same migration tag a second time, so the upload is repeated without it.
+    if (withDO) { try { await upload(true); } catch (e1) { try { await upload(false); } catch (e2) { throw new Error(String(e2.message || e2) + (String(e1.message) !== String(e2.message) ? ' (first try: ' + e1.message + ')' : '')); } } }
+    else await upload(false);
+
+    // 4. workers.dev address
+    log('domain');
+    let sub;
+    try { sub = (await cf(token, 'GET', `${a}/workers/subdomain`)).subdomain; } catch {}
+    for (let i = 0; !sub && i < 4; i++) {
+      const s = 'xr-' + crypto.randomBytes(3).toString('hex');
+      try { sub = (await cf(token, 'PUT', `${a}/workers/subdomain`, { subdomain: s })).subdomain; } catch {}
+    }
+    if (!sub) throw new Error('workers.dev subdomain could not be created');
+    await cf(token, 'POST', `${a}/workers/scripts/${name}/subdomain`, { enabled: true, previews_enabled: false });
+    const domain = `${name}.${sub}.workers.dev`;
+
+    // 5. wait until it answers
+    log('check');
+    const badW = await waitUp(domain, 10, 3000);
+    if (badW) throw new Error(`Deployed to https://${domain}, but the site answers ${badW}`);
+    job.domain = domain; job.status = 'done';
+  } catch (e) { job.status = 'error'; job.error = String(e.message || e); }
+  setTimeout(() => jobs.delete(job.id), 30 * 60e3);
+}
+
+// ---------- HTTP ----------
+const body = req => new Promise(res => { let d = ''; req.on('data', c => (d += c) && d.length > 2e4 && req.destroy()); req.on('end', () => { try { res(JSON.parse(d || '{}')); } catch { res({}); } }); });
+const send = (res, o, c = 200) => { res.writeHead(c, { 'content-type': 'application/json', 'cache-control': 'no-store' }); res.end(JSON.stringify(o)); };
+
+http.createServer(async (req, res) => {
+  const url = new URL(req.url, 'http://x');
+  try {
+    if (req.method === 'POST' && url.pathname === '/api/verify') {
+      const { token } = await body(req);
+      if (!token || token.length < 20) return send(res, { error: 'bad token' }, 400);
+      const accounts = await cf(token, 'GET', '/accounts?per_page=20');
+      if (!accounts.length) return send(res, { error: 'no account for this token' }, 400);
+      return send(res, { accounts: accounts.map(x => ({ id: x.id, name: x.name })) });
+    }
+    if (req.method === 'POST' && url.pathname === '/api/deploy') {
+      const { token, accountId, name, plan, target } = await body(req);
+      if (!/^[a-z0-9][a-z0-9-]{1,40}$/.test(name || '') || !/^[a-f0-9]{32}$/.test(accountId || '') || !token) return send(res, { error: 'bad input' }, 400);
+      if (jobs.size > 20) return send(res, { error: 'busy' }, 429);
+      const job = { id: crypto.randomUUID(), status: 'run', logs: [] };
+      jobs.set(job.id, job);
+      (target === 'pages' ? deployPages : deploy)(job, { token, accountId, name, plan });   // token lives only in this closure
+      return send(res, { id: job.id });
+    }
+    if (url.pathname.startsWith('/api/job/')) {
+      const j = jobs.get(url.pathname.slice(9));
+      return j ? send(res, { status: j.status, logs: j.logs, domain: j.domain, error: j.error }) : send(res, { error: 'not found' }, 404);
+    }
+    if (url.pathname === '/health') return send(res, { ok: true });
+    const f = path.join(ROOT, 'public', url.pathname === '/' ? 'index.html' : url.pathname.replace(/\.\./g, ''));
+    if (fs.existsSync(f) && fs.statSync(f).isFile()) {
+      res.writeHead(200, { 'content-type': MIME[path.extname(f).slice(1)] || 'application/octet-stream' });
+      return fs.createReadStream(f).pipe(res);
+    }
+    res.writeHead(404).end('not found');
+  } catch (e) { send(res, { error: String(e.message || e) }, 400); }
+}).listen(process.env.PORT || 3000, '0.0.0.0', () => console.log('xr deployer up'));
